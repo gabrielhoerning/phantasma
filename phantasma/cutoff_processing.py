@@ -152,6 +152,49 @@ def _create_intermediate_wcs(center_l, center_b, size_deg, pixel_size_arcmin):
     return w, (n_pix, n_pix)
 
 
+def make_target_wcs(center_l, center_b, pixel_size_arcmin, cutout_size_deg):
+    """
+    Create a gnomonic (TAN) WCS in Galactic coordinates to use as the
+    output grid for ``preprocess_and_cutout``.
+
+    Parameters
+    ----------
+    center_l : float
+        Galactic longitude of the cutout centre [deg].
+    center_b : float
+        Galactic latitude of the cutout centre [deg].
+    pixel_size_arcmin : float
+        Desired output pixel size [arcmin].
+    cutout_size_deg : float
+        Angular size of the cutout [deg].  The grid will be square with
+        ``ceil(cutout_size_deg / pixel_size_deg)`` pixels per side
+        (rounded up to the nearest even number).
+
+    Returns
+    -------
+    wcs : astropy.wcs.WCS
+        2-D WCS centred on (center_l, center_b) with TAN projection.
+    shape : tuple of int
+        ``(ny, nx)`` shape of the corresponding output grid.
+
+    Examples
+    --------
+    >>> target_wcs, shape = make_target_wcs(17.0, 0.8, pixel_size_arcmin=2.0, cutout_size_deg=2.0)
+    >>> data_out, wcs_out = ph.preprocess_and_cutout(..., target_wcs=target_wcs)
+    """
+    pixel_size_deg = pixel_size_arcmin / 60.0
+    n_pix = int(np.ceil(cutout_size_deg / pixel_size_deg))
+    if n_pix % 2 == 1:
+        n_pix += 1  # keep even for symmetry
+
+    w = WCS(naxis=2)
+    w.wcs.crpix = [n_pix / 2.0 + 0.5, n_pix / 2.0 + 0.5]
+    w.wcs.cdelt = [-pixel_size_deg, pixel_size_deg]
+    w.wcs.crval = [center_l, center_b]
+    w.wcs.ctype = ["GLON-TAN", "GLAT-TAN"]
+    return w, (n_pix, n_pix)
+
+
 def _sanitise(data):
     """Replace non-finite values (inf, UNSEEN, etc.) with NaN."""
     out = np.array(data, dtype=np.float64)
