@@ -4,7 +4,7 @@ Utilities to preprocess astronomical maps: smooth to a target resolution
 accounting for pixel window functions, reproject to a target WCS, and
 extract a cutout.
 
-Supports both FITS (flat-sky) and HEALPix input maps.
+Supports both FITS (flat-sky, provided as data+WCS) and HEALPix input maps.
 """
 
 import numpy as np
@@ -162,8 +162,9 @@ def _sanitise(data):
 
 
 def preprocess_and_cutout(
-    input_map,
+    data,
     map_format="fits",
+    original_wcs=None,
     center_l=0.0,
     center_b=0.0,
     cutout_size_deg=1.0,
@@ -171,26 +172,31 @@ def preprocess_and_cutout(
     target_res_arcmin=10.0,
     pixel_size_arcmin=1.0,
     target_wcs=None,
-    target_shape=None,
     healpix_coord="G",
-    fits_hdu=0,
 ):
     """
-    Read an astronomical map, smooth it to a target resolution (accounting for
-    pixel window functions), and reproject it onto a target WCS grid.
+    Smooth an astronomical map to a target resolution and reproject it onto
+    a target WCS grid.
 
-    The function handles both flat-sky FITS images and HEALPix maps.
-    Reprojection is done with ``reproject_exact`` (flux-conserving).
+    The function handles both flat-sky FITS images (provided as a numpy array
+    + WCS) and HEALPix maps (provided as a 1-D pixel array).  Reprojection is
+    done with ``reproject_exact`` (flux-conserving).
+
+    The original pixel scale is read automatically from ``original_wcs`` (for
+    FITS) or computed from the HEALPix Nside (for HEALPix).  The output grid
+    shape is computed from ``pixel_size_arcmin`` and ``cutout_size_deg``.
 
     Parameters
     ----------
-    input_map : str or numpy.ndarray or tuple
-        - For ``map_format='fits'``: a file path (str) or a ``(data, wcs)``
-          tuple.
-        - For ``map_format='healpix'``: a 1-D numpy array of HEALPix pixel
-          values (the caller is responsible for reading the file).
+    data : numpy.ndarray
+        - For ``map_format='fits'``: 2-D (or higher, extra axes are dropped)
+          pixel array of the original map.
+        - For ``map_format='healpix'``: 1-D HEALPix pixel array.
     map_format : {'fits', 'healpix'}
         Format of the input map.
+    original_wcs : astropy.wcs.WCS, optional
+        WCS of the original FITS map.  Required when ``map_format='fits'``;
+        ignored for ``'healpix'`` (Nside is inferred from the array length).
     center_l : float
         Galactic longitude of the cutout centre [deg].
     center_b : float
@@ -200,23 +206,18 @@ def preprocess_and_cutout(
     original_res_arcmin : float
         Original *beam* FWHM of the input map [arcmin].  This is the
         Gaussian beam only — the pixel window is accounted for separately
-        using the pixel sizes.
+        using the pixel scales.
     target_res_arcmin : float
         Desired *total effective* FWHM after smoothing and reprojection
         [arcmin].
     pixel_size_arcmin : float
-        Pixel size of the *output* grid [arcmin].  Used to compute the pixel
-        window correction.
+        Pixel size of the *output* grid [arcmin].  Used both to compute the
+        pixel window correction and to determine the output grid shape.
     target_wcs : astropy.wcs.WCS
-        WCS of the output grid.  Together with ``target_shape`` this fully
-        defines the output pixelisation.
-    target_shape : tuple of int
-        Shape ``(ny, nx)`` of the output grid.
+        WCS of the output grid.
     healpix_coord : str, optional
         Coordinate system of the HEALPix map: ``'G'`` (Galactic), ``'C'``
         (Celestial/Equatorial), ``'E'`` (Ecliptic).  Default ``'G'``.
-    fits_hdu : int, optional
-        HDU index to read from a FITS file (default 0).
 
     Returns
     -------
@@ -243,12 +244,12 @@ def preprocess_and_cutout(
     if target_wcs is None:
         raise ValueError("target_wcs must be provided.")
 
-    if target_shape is None:
-        pixel_size_deg = pixel_size_arcmin / 60.0
-        n_pix = int(np.ceil(cutout_size_deg / pixel_size_deg))
-        if n_pix % 2 == 1:
-            n_pix += 1  # keep even for symmetry
-        target_shape = (n_pix, n_pix)
+    # Output grid shape derived from output pixel scale and cutout size
+    pixel_size_deg = pixel_size_arcmin / 60.0
+    n_pix = int(np.ceil(cutout_size_deg / pixel_size_deg))
+    if n_pix % 2 == 1:
+        n_pix += 1  # keep even for symmetry
+    target_shape = (n_pix, n_pix)
 
     # ------------------------------------------------------------------
     # 1.  Read / prepare the input map on a flat-sky intermediate grid
@@ -259,14 +260,18 @@ def preprocess_and_cutout(
     padded_size_deg = cutout_size_deg + 2.0 * padding_deg
 
     if map_format == "healpix":
-        data, current_wcs, current_pixel_arcmin = _read_healpix(
-            input_map, healpix_coord,
+        data_proc, current_wcs, current_pixel_arcmin = _read_healpix(
+            data, healpix_coord,
             center_l, center_b, padded_size_deg, pixel_size_arcmin,
         )
 
     elif map_format == "fits":
-        data, current_wcs, current_pixel_arcmin = _read_fits(
-            input_map, fits_hdu,
+        if original_wcs is None:
+            raise ValueError(
+                "original_wcs must be provided when map_format='fits'."
+            )
+        data_proc, current_wcs, current_pixel_arcmin = _read_fits(
+            data, original_wcs,
             center_l, center_b, padded_size_deg,
         )
 
@@ -276,7 +281,7 @@ def preprocess_and_cutout(
     # ------------------------------------------------------------------
     # 2.  Sanitise – replace sentinels / inf with NaN
     # ------------------------------------------------------------------
-    data = _sanitise(data)
+    data_proc = _sanitise(data_proc)
 
     # ------------------------------------------------------------------
     # 3.  Smooth to the target resolution
@@ -284,16 +289,16 @@ def preprocess_and_cutout(
     sigma_pix, fwhm_kernel = _compute_smoothing_kernel_sigma_pix(
         original_res_arcmin,
         target_res_arcmin,
-        orig_pixel_size_arcmin=current_pixel_arcmin,   # original pixel window
-        new_pixel_size_arcmin=pixel_size_arcmin,        # new pixel window
-        current_pixel_scale_arcmin=current_pixel_arcmin, # for arcmin → px conversion
+        orig_pixel_size_arcmin=current_pixel_arcmin,
+        new_pixel_size_arcmin=pixel_size_arcmin,
+        current_pixel_scale_arcmin=current_pixel_arcmin,
     )
 
     if sigma_pix is not None and sigma_pix > 0:
         # Use astropy convolve to properly handle NaN pixels.
         kernel = Gaussian2DKernel(x_stddev=sigma_pix)
-        data = convolve(
-            data, kernel,
+        data_proc = convolve(
+            data_proc, kernel,
             boundary="fill",
             fill_value=np.nan,
             nan_treatment="interpolate",
@@ -303,7 +308,7 @@ def preprocess_and_cutout(
     # ------------------------------------------------------------------
     # 4.  Reproject to the target WCS  (exact / flux-conserving)
     # ------------------------------------------------------------------
-    input_hdu = fits.PrimaryHDU(data=data, header=current_wcs.to_header())
+    input_hdu = fits.PrimaryHDU(data=data_proc, header=current_wcs.to_header())
 
     reprojected, footprint = reproject_exact(
         input_hdu, target_wcs, shape_out=target_shape,
@@ -372,9 +377,19 @@ def _read_healpix(
     return data, inter_wcs, intermediate_pix
 
 
-def _read_fits(input_map, hdu_idx, center_l, center_b, padded_size_deg):
+def _read_fits(data, wcs, center_l, center_b, padded_size_deg):
     """
-    Read a FITS map and extract a padded cutout around (l, b).
+    Extract a padded cutout from a FITS map (provided as array + WCS).
+
+    The original pixel scale is read directly from the provided WCS.
+
+    Parameters
+    ----------
+    data : 2-D (or higher) ndarray
+        Pixel data of the original FITS map.
+    wcs : astropy.wcs.WCS
+        WCS of the original FITS map (used to determine pixel scale and
+        to convert sky coordinates to pixel positions).
 
     Returns
     -------
@@ -382,36 +397,24 @@ def _read_fits(input_map, hdu_idx, center_l, center_b, padded_size_deg):
     wcs  : WCS
     pixel_scale_arcmin : float
     """
-    if isinstance(input_map, str):
-        hdu_list = fits.open(input_map)
-        raw_data = hdu_list[hdu_idx].data.astype(np.float64)
-        raw_wcs = WCS(hdu_list[hdu_idx].header, naxis=2)
-        hdu_list.close()
-    elif isinstance(input_map, tuple) and len(input_map) == 2:
-        raw_data, raw_wcs = input_map
-        raw_data = np.asarray(raw_data, dtype=np.float64)
-    else:
-        raise ValueError(
-            "For 'fits' format, provide a file path (str) or (data, wcs) tuple."
-        )
+    raw_data = np.asarray(data, dtype=np.float64)
+    raw_wcs = wcs
 
     # Collapse extra dimensions (e.g. freq / Stokes)
     while raw_data.ndim > 2:
         raw_data = raw_data[0]
 
-    # Pixel scale
+    # Pixel scale — read from WCS, no user input required
     pixel_scales_deg = proj_plane_pixel_scales(raw_wcs)  # deg per pixel
     pixel_scale_arcmin = np.mean(pixel_scales_deg) * 60.0
 
     # --- cut out a padded region around the requested centre ---
     center = SkyCoord(l=center_l * u.deg, b=center_b * u.deg, frame="galactic")
 
-    # Cutout2D needs the position in pixel coords of the *current* WCS.
-    # Convert Galactic → whatever the map WCS frame is.
+    # Convert Galactic → whatever frame the map WCS uses
     try:
         pix_x, pix_y = raw_wcs.world_to_pixel(center)
     except Exception:
-        # If the WCS frame doesn't directly accept Galactic, convert to ICRS
         center_icrs = center.icrs
         pix_x, pix_y = raw_wcs.world_to_pixel(center_icrs)
 
@@ -423,16 +426,15 @@ def _read_fits(input_map, hdu_idx, center_l, center_b, padded_size_deg):
             raw_data, position=position, size=size_pix,
             wcs=raw_wcs, mode="partial", fill_value=np.nan,
         )
-        data = cutout.data
+        data_out = cutout.data
         wcs_out = cutout.wcs
     except Exception:
-        # If cutout fails (e.g. completely outside), return NaN array
         warnings.warn(
             "Cutout region falls outside the input FITS map; "
             "returning NaN-filled array.",
             stacklevel=3,
         )
-        data = np.full((size_pix, size_pix), np.nan)
-        wcs_out = raw_wcs  # fallback
+        data_out = np.full((size_pix, size_pix), np.nan)
+        wcs_out = raw_wcs
 
-    return data, wcs_out, pixel_scale_arcmin
+    return data_out, wcs_out, pixel_scale_arcmin
