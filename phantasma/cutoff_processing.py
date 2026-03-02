@@ -205,6 +205,7 @@ def _sanitise(data, remove_healpix_unseen=False):
 def smooth_cutout(
     data,
     map_format="fits",
+    rms_data=None,
     original_wcs=None,
     center_l=0.0,
     center_b=0.0,
@@ -236,6 +237,13 @@ def smooth_cutout(
         - For ``map_format='healpix'``: 1-D HEALPix pixel array.
     map_format : {'fits', 'healpix'}
         Format of the input map.
+    rms_data : numpy.ndarray, optional
+        RMS (noise) map associated with ``data``, same shape and pixelisation.
+        When provided, pixels are weighted by inverse variance (``w = 1/rms²``)
+        during both the Gaussian smoothing and the reprojection steps.  Pixels
+        where the RMS is zero or NaN receive zero weight and do not contribute
+        to the output.  The RMS map itself is **not** smoothed or propagated;
+        only the original values are used as weights.
     original_wcs : astropy.wcs.WCS, optional
         WCS of the original FITS map.  Required when ``map_format='fits'``;
         ignored for ``'healpix'`` (Nside is inferred from the array length).
@@ -257,6 +265,9 @@ def smooth_cutout(
         pixel window correction and to determine the output grid shape.
     target_wcs : astropy.wcs.WCS
         WCS of the output grid.
+    target_shape : tuple of int, optional
+        Shape ``(ny, nx)`` of the output grid.  Computed automatically from
+        ``pixel_size_arcmin`` and ``cutout_size_deg`` if not provided.
     healpix_coord : str, optional
         Coordinate system of the HEALPix map: ``'G'`` (Galactic), ``'C'``
         (Celestial/Equatorial), ``'E'`` (Ecliptic).  Default ``'G'``.
@@ -282,6 +293,19 @@ def smooth_cutout(
 
     where  FWHM_pix ≈ 0.68 × pixel_size  (Gaussian approximation of a
     square top-hat pixel window).
+
+    **Weighted smoothing (when rms_data is provided)**
+
+    The weighted convolution is computed as::
+
+        w = 1 / rms²
+        data_smooth = convolve(w * data, K) / convolve(w, K)
+
+    For reprojection, numerator and denominator are reprojected separately::
+
+        data_out = reproject(w_smooth * data_smooth) / reproject(w_smooth)
+
+    where ``w_smooth = convolve(w, K)`` are the weights after smoothing.
     """
     if target_wcs is None:
         raise ValueError("target_wcs must be provided.")
@@ -316,6 +340,13 @@ def smooth_cutout(
             data, healpix_coord,
             center_l, center_b, padded_size_deg, pixel_size_arcmin,
         )
+        if rms_data is not None:
+            rms_proc, _, _ = _read_healpix(
+                rms_data, healpix_coord,
+                center_l, center_b, padded_size_deg, pixel_size_arcmin,
+            )
+        else:
+            rms_proc = None
 
     elif map_format == "fits":
         if original_wcs is None:
@@ -326,6 +357,13 @@ def smooth_cutout(
             data, original_wcs,
             center_l, center_b, padded_size_deg,
         )
+        if rms_data is not None:
+            rms_proc, _, _ = _read_fits(
+                rms_data, original_wcs,
+                center_l, center_b, padded_size_deg,
+            )
+        else:
+            rms_proc = None
 
     else:
         raise ValueError(f"Unknown map_format: '{map_format}'")
@@ -334,6 +372,15 @@ def smooth_cutout(
     # 2.  Sanitise – replace sentinels / inf with NaN
     # ------------------------------------------------------------------
     data_proc = _sanitise(data_proc, remove_healpix_unseen=(map_format == "healpix"))
+
+    # Compute inverse-variance weights from the RMS map (if provided).
+    # w = 0 where RMS is NaN or zero so those pixels never contribute.
+    if rms_proc is not None:
+        rms_proc = _sanitise(rms_proc)
+        w = np.where(np.isfinite(rms_proc) & (rms_proc > 0),
+                     1.0 / rms_proc**2, 0.0)
+    else:
+        w = None
 
     # ------------------------------------------------------------------
     # 3.  Smooth to the target resolution
@@ -347,24 +394,53 @@ def smooth_cutout(
     )
 
     if sigma_pix is not None and sigma_pix > 0:
-        # Use astropy convolve to properly handle NaN pixels.
         kernel = Gaussian2DKernel(x_stddev=sigma_pix)
-        data_proc = convolve(
-            data_proc, kernel,
-            boundary="fill",
-            fill_value=np.nan,
-            nan_treatment="interpolate",
-            preserve_nan=True,
-        )
+        if w is not None:
+            # Weighted Gaussian smoothing: convolve(w*data, K) / convolve(w, K)
+            # Only count pixels that are both valid in data AND have positive weight.
+            valid = np.isfinite(data_proc) & (w > 0)
+            w_data = np.where(valid, w * data_proc, 0.0)
+            w_only = np.where(valid, w, 0.0)
+            numer = convolve(w_data, kernel, boundary="fill", fill_value=0.0,
+                             nan_treatment="fill")
+            denom = convolve(w_only, kernel, boundary="fill", fill_value=0.0,
+                             nan_treatment="fill")
+            data_proc = np.where(denom > 0, numer / denom, np.nan)
+            w = denom  # smoothed weight map — used for weighted reprojection
+        else:
+            # Standard (unweighted) smoothing
+            data_proc = convolve(
+                data_proc, kernel,
+                boundary="fill",
+                fill_value=np.nan,
+                nan_treatment="interpolate",
+                preserve_nan=True,
+            )
+    elif w is not None:
+        # No kernel needed, but mask pixels invalid in data
+        w = np.where(np.isfinite(data_proc) & (w > 0), w, 0.0)
 
     # ------------------------------------------------------------------
     # 4.  Reproject to the target WCS  (exact / flux-conserving)
     # ------------------------------------------------------------------
-    input_hdu = fits.PrimaryHDU(data=data_proc, header=current_wcs.to_header())
+    if w is not None:
+        # Weighted reprojection: reproject numerator (w*data) and denominator
+        # (w) separately, then divide — equivalent to inverse-variance co-adding.
+        w_data = np.where(np.isfinite(data_proc), w * data_proc, 0.0)
+        hdu_wd = fits.PrimaryHDU(data=w_data,    header=current_wcs.to_header())
+        hdu_w  = fits.PrimaryHDU(data=w,         header=current_wcs.to_header())
 
-    reprojected, footprint = reproject_exact(
-        input_hdu, target_wcs, shape_out=target_shape,
-    )
+        repr_wd, fp_wd = reproject_exact(hdu_wd, target_wcs, shape_out=target_shape)
+        repr_w,  fp_w  = reproject_exact(hdu_w,  target_wcs, shape_out=target_shape)
+
+        reprojected = np.where((fp_w > 0) & (repr_w > 0),
+                               repr_wd / repr_w, np.nan)
+    else:
+        input_hdu = fits.PrimaryHDU(data=data_proc, header=current_wcs.to_header())
+        reprojected, footprint = reproject_exact(
+            input_hdu, target_wcs, shape_out=target_shape,
+        )
+        reprojected = np.where(footprint > 0, reprojected, np.nan)
 
     # ------------------------------------------------------------------
     # 5.  Mask invalid / zero-footprint pixels with NaN
